@@ -19,19 +19,16 @@ TODO:
 import glob
 import json
 import os
-import re
-import sys
-import uuid
 import yaml
 import yamlordereddictloader
 import argparse
 import urllib.parse
 import requests
-from collections import defaultdict, OrderedDict
-from utils import reformat_phone_number, get_data_dir
 
 parser = argparse.ArgumentParser()
 parser.add_argument("state", help="Two letter state abbreviation")
+
+#TODO: Env arg so it stays out of the cli
 parser.add_argument(
     "key", help="Google Civic API Key. See https://developers.google.com/civic-information/docs/v2/")
 
