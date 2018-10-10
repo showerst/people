@@ -16,7 +16,6 @@ TODO:
     entry is in fact our person, and script to merge social media into our person record
 """
 
-
 import glob
 import json
 import os
@@ -41,9 +40,6 @@ args = parser.parse_args()
 args.state = args.state.lower()
 
 dirname = "./test/{}/".format(args.state)
-print(dirname)
-people = []
-
 
 # This is a temp function, don't re-use it
 def parse_jurisdiction(state, chamber, district):
@@ -60,7 +56,7 @@ def parse_jurisdiction(state, chamber, district):
 people = {}
 
 # load the members into
-# people["OCD ID"] = person
+# people["OCD ID"] = [list of names]
 for filename in glob.glob(os.path.join(dirname, '*.yml')):
     with open(filename) as f:
         data = yaml.load(f, Loader=yamlordereddictloader.Loader)
@@ -85,8 +81,9 @@ for filename in glob.glob(os.path.join(dirname, '*.yml')):
         else:
             people[jurisdiction] = names
 
-# print(people)
-
+# for each OCD, hit the VIP endpoint,
+# pull all the upper/lower legislators,
+# and compare the names in VIP to the repo names
 url_pattern = 'https://www.googleapis.com/civicinfo/v2/representatives/{}?key={}'
 for ocd, names in people.items():
     vip_officials = []
@@ -102,11 +99,6 @@ for ocd, names in people.items():
             for index in role['officialIndices']:
                 vip_officials.append(vip['officials'][index]['name'])
 
-    # print("***")
-    # print (vip_officials)
-    # print("----")
-    # print(people[ocd])
-
     for vip_name in vip_officials:
         if vip_name not in people[ocd]:
             print(
@@ -116,5 +108,3 @@ for ocd, names in people.items():
                     ', '.join(people[ocd])
                 )
             )
-
-    # sys.exit()
