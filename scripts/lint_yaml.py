@@ -3,15 +3,14 @@ import re
 import os
 import yaml
 import glob
-import datetime
 import click
-from utils import get_data_dir
+from utils import get_data_dir, get_filename, role_is_active
 from collections import defaultdict, Counter
 
 
 DATE_RE = re.compile(r'^\d{4}(-\d{2}(-\d{2})?)?$')
 PHONE_RE = re.compile(r'^(1-)?\d{3}-\d{3}-\d{4}( ext. \d+)?$')
-UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+UUID_RE = re.compile(r'^ocd-\w+/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 LEGACY_OS_ID_RE = re.compile(r'[A-Z]{2}L\d{6}')
 
 
@@ -33,7 +32,7 @@ def is_dict(val):
 
 
 def is_string(val):
-    return isinstance(val, str)
+    return isinstance(val, str) and '\n' not in val
 
 
 def is_url(val):
@@ -52,16 +51,26 @@ def is_phone(val):
     return is_string(val) and PHONE_RE.match(val)
 
 
-def is_uuid(val):
-    return is_string(val) and UUID_RE.match(val)
-
-
 def is_ocd_jurisdiction(val):
     return is_string(val) and val.startswith('ocd-jurisdiction/')
 
 
+def is_ocd_person(val):
+    return is_string(val) and val.startswith('ocd-person/') and UUID_RE.match(val)
+
+
+def is_ocd_organization(val):
+    return is_string(val) and val.startswith('ocd-organization/') and UUID_RE.match(val)
+
+
 def is_legacy_openstates(val):
     return is_string(val) and LEGACY_OS_ID_RE.match(val)
+
+
+URL_LIST = NestedList({
+    'note': [is_string],
+    'url': [is_url, Required],
+})
 
 
 CONTACT_DETAILS = NestedList({
@@ -72,14 +81,61 @@ CONTACT_DETAILS = NestedList({
     'fax': [is_phone],
 })
 
-URL_LIST = NestedList({
-    'note': [is_string],
-    'url': [is_url, Required],
-})
 
+LEGISLATIVE_ROLE_FIELDS = {
+    'type': [is_string, Required],
+    'district': [is_string, Required],
+    'jurisdiction': [is_ocd_jurisdiction, Required],
+    'start_date': [is_fuzzy_date],
+    'end_date': [is_fuzzy_date],
+    'contact_details': CONTACT_DETAILS,
+}
+
+
+EXECUTIVE_ROLE_FIELDS = {
+    'type': [is_string, Required],
+    'jurisdiction': [is_ocd_jurisdiction, Required],
+    'start_date': [is_fuzzy_date],
+    'end_date': [is_fuzzy_date],
+    'contact_details': CONTACT_DETAILS,
+}
+
+
+def is_role(role):
+    role_type = role.get('type')
+    if role_type in ('upper', 'lower', 'legislature'):
+        return validate_obj(role, LEGISLATIVE_ROLE_FIELDS)
+    elif role_type in ('gov', 'lt_gov'):
+        return validate_obj(role, EXECUTIVE_ROLE_FIELDS)
+    else:
+        return ['invalid type']
+
+
+def is_valid_parent(parent):
+    return parent in ('upper', 'lower', 'legislature')
+
+
+ORGANIZATION_FIELDS = {
+    'id': [is_ocd_organization, Required],
+    'name': [is_string, Required],
+    'jurisdiction': [is_ocd_jurisdiction, Required],
+    'parent': [is_valid_parent, Required],
+    'classification': [is_string, Required],    # TODO: tighten this
+    'founding_date': [is_fuzzy_date],
+    'dissolution_date': [is_fuzzy_date],
+    'memberships': NestedList({
+        'id': [is_ocd_person],
+        'name': [is_string, Required],
+        'role': [is_string],
+        'start_date': [is_fuzzy_date],
+        'end_date': [is_fuzzy_date],
+    }),
+    'sources': URL_LIST,
+    'links': URL_LIST,
+}
 
 PERSON_FIELDS = {
-    'id': [is_uuid, Required],
+    'id': [is_ocd_person, Required],
     'name': [is_string, Required],
     'sort_name': [is_string],
     'given_name': [is_string],
@@ -111,25 +167,12 @@ PERSON_FIELDS = {
         'end_date': [is_fuzzy_date],
     }),
     'sources': URL_LIST,
-    'committees': NestedList({
-        'name': [is_string, Required],
-        'post': [is_string],
-        'start_date': [is_fuzzy_date],
-        'end_date': [is_fuzzy_date],
-    }),
     'party': NestedList({
         'name': [is_string, Required],
         'start_date': [is_fuzzy_date],
         'end_date': [is_fuzzy_date],
     }),
-    'roles': NestedList({
-        'chamber': [is_string, Required],
-        'district': [is_string, Required],
-        'jurisdiction': [is_ocd_jurisdiction, Required],
-        'start_date': [is_fuzzy_date],
-        'end_date': [is_fuzzy_date],
-        'contact_details': CONTACT_DETAILS,
-    }),
+    'roles': NestedList(is_role),
     'extras': [is_dict],
 }
 
@@ -163,9 +206,15 @@ def validate_obj(obj, schema, prefix=None):
         elif isinstance(validators, dict):
             errors.extend(validate_obj(value, validators, [field]))
         elif isinstance(validators, NestedList):
-            # validate list elements against child schema
-            for index, item in enumerate(value):
-                errors.extend(validate_obj(item, validators.subschema, [field, str(index)]))
+            if isinstance(validators.subschema, dict):
+                # validate list elements against child schema
+                for index, item in enumerate(value):
+                    errors.extend(validate_obj(item, validators.subschema, [field, str(index)]))
+            else:
+                # subschema can also be a validation function
+                for index, item in enumerate(value):
+                    errors.extend(['.'.join([field, str(index)]) + ': ' + e
+                                   for e in validators.subschema(item)])
         else:
             raise Exception('invalid schema {}'.format(validators))
 
@@ -176,15 +225,12 @@ def validate_obj(obj, schema, prefix=None):
     return errors
 
 
-def role_is_active(role):
-    now = datetime.datetime.utcnow().date().strftime('%Y-%m-%d')
-    return role.get('end_date') is None or role.get('end_date') > now
-
-
-def validate_roles(person, roles_key):
+def validate_roles(person, roles_key, retired=False):
     active = [role for role in person[roles_key] if role_is_active(role)]
-    if len(active) == 0:
+    if len(active) == 0 and not retired:
         return [f'no active {roles_key}']
+    elif roles_key == 'roles' and retired and len(active) > 0:
+        return [f'{len(active)} active roles on retired person']
     elif roles_key == 'roles' and len(active) > 1:
         return [f'{len(active)} active roles']
     return []
@@ -224,10 +270,11 @@ def compare_districts(expected, actual):
         for district in sorted(actual_districts - expected_districts):
             errors.append(f'extra legislator for unexpected seat {chamber} {district}')
         for district in sorted(actual_districts & expected_districts):
-            if actual[chamber][district] < expected[chamber][district]:
+            if len(actual[chamber][district]) < expected[chamber][district]:
                 warnings.append(f'missing legislator for {chamber} {district}')
-            if actual[chamber][district] > expected[chamber][district]:
-                errors.append(f'extra legislator for {chamber} {district}')
+            if len(actual[chamber][district]) > expected[chamber][district]:
+                people = '\n\t'.join(get_filename(o) for o in actual[chamber][district])
+                errors.append(f'extra legislator for {chamber} {district}:\n\t' + people)
     return errors, warnings
 
 
@@ -239,26 +286,47 @@ class Validator:
                               ))
 
     def __init__(self, settings, abbr):
-        self.http_whitelist = tuple(settings['http_whitelist'])
+        self.http_whitelist = tuple(settings.get('http_whitelist', []))
         self.expected = get_expected_districts(settings[abbr])
         self.errors = defaultdict(list)
         self.warnings = defaultdict(list)
-        self.count = 0
+        self.person_count = 0
+        self.retired_count = 0
+        self.org_count = 0
+        self.missing_person_id = 0
+        self.role_types = defaultdict(int)
+        self.parent_types = defaultdict(int)
+        self.person_mapping = {}
         self.parties = Counter()
-        self.committees = Counter()
         self.contact_counts = Counter()
         self.id_counts = Counter()
         self.optional_fields = Counter()
         self.extra_counts = Counter()
-        self.chamber_districts = defaultdict(Counter)
+        self.active_legislators = defaultdict(lambda: defaultdict(list))
 
-    def validate_person(self, person, filename):
+    def validate_person(self, person, filename, retired=False):
         self.errors[filename] = validate_obj(person, PERSON_FIELDS)
-        self.errors[filename].extend(validate_roles(person, 'roles'))
+        self.errors[filename].extend(validate_roles(person, 'roles', retired))
         self.errors[filename].extend(validate_roles(person, 'party'))
         # TODO: this was too ambitious, disabling this for now
         # self.warnings[filename] = self.check_https(person)
-        self.summarize_person(person)
+        self.person_mapping[person['id']] = person['name']
+        if retired:
+            self.retired_count += 1
+        else:
+            self.summarize_person(person)
+
+    def validate_org(self, org, filename):
+        self.errors[filename] = validate_obj(org, ORGANIZATION_FIELDS)
+        for m in org['memberships']:
+            if not m.get('id'):
+                continue
+            if m['id'] not in self.person_mapping:
+                self.errors[filename].append(f'invalid person ID {m["id"]}')
+            elif self.person_mapping[m['id']] != m['name']:
+                name = self.person_mapping[m['id']]
+                self.warnings[filename].append(f'ID {m["id"]} refers to {name}, not {m["name"]}')
+        self.summarize_org(org)
 
     def check_https_url(self, url):
         if url and url.startswith('http://') and not url.startswith(self.http_whitelist):
@@ -280,27 +348,23 @@ class Validator:
         return warnings
 
     def summarize_person(self, person):
-        chamber = None
+        role_type = None
         district = None
 
-        self.count += 1
+        self.person_count += 1
         self.optional_fields.update(set(person.keys()) & self.OPTIONAL_FIELD_SET)
         self.extra_counts.update(person.get('extras', {}).keys())
 
         for role in person.get('roles', []):
             if role_is_active(role):
-                chamber = role['chamber']
-                district = role['district']
+                role_type = role['type']
+                district = role.get('district')
                 break
-        self.chamber_districts[chamber][district] += 1
+        self.active_legislators[role_type][district].append(person)
 
         for role in person.get('party', []):
             if role_is_active(role):
                 self.parties[role['name']] += 1
-
-        for role in person.get('committees', []):
-            if role_is_active(role):
-                self.committees[role['name']] += 1
 
         for cd in person.get('contact_details', []):
             for key in cd:
@@ -311,6 +375,20 @@ class Validator:
             self.id_counts[scheme] += 1
         for id in person.get('other_identifiers', []):
             self.id_counts[id['scheme']] += 1
+
+    def summarize_org(self, org):
+        self.org_count += 1
+
+        if org['parent'].startswith('ocd-organization'):
+            self.parent_types['subcommittee'] += 1
+        else:
+            self.parent_types[org['parent']] += 1
+
+        for m in org['memberships']:
+            if not m.get('id'):
+                self.missing_person_id += 1
+            if role_is_active(m):
+                self.role_types[m.get('role', 'member')] += 1
 
     def print_validation_report(self, verbose):
         for fn, errors in self.errors.items():
@@ -324,17 +402,18 @@ class Validator:
             if not errors and verbose > 0:
                 click.secho(fn, 'OK!', fg='green')
 
-        errors, warnings = compare_districts(self.expected, self.chamber_districts)
+        errors, warnings = compare_districts(self.expected, self.active_legislators)
         for err in errors:
             click.secho(err, fg='red')
         for warning in warnings:
             click.secho(warning, fg='yellow')
 
     def print_summary(self):
-        click.secho(f'processed {self.count} files', bold=True)
-        upper = sum(self.chamber_districts['upper'].values())
-        lower = sum(self.chamber_districts['lower'].values())
-        click.secho(f'{upper:4d} upper\n{lower:4d} lower')
+        click.secho(f'processed {self.person_count} active people, {self.retired_count} retired & '
+                    f'{self.org_count} organizations', bold=True)
+        for role_type in self.active_legislators:
+            count = sum([len(v) for v in self.active_legislators[role_type].values()])
+            click.secho(f'{count:4d} {role_type}')
 
         click.secho('Parties', bold=True)
         for party, count in self.parties.items():
@@ -345,11 +424,6 @@ class Validator:
             else:
                 color = 'green'
             click.secho(f'{count:4d} {party} ', bg=color)
-
-        click.secho('Committees', bold=True)
-        for com, count in sorted(self.committees.items(),
-                                 key=lambda x: x[1], reverse=True):
-            click.secho(f'{count:4d} {com} ')
 
         for name, collection in {'Contact Info': self.contact_counts,
                                  'Identifiers': self.id_counts,
@@ -362,20 +436,40 @@ class Validator:
             else:
                 click.secho(name + ' - none', bold=True)
 
+        click.secho('Committees', bold=True)
+        for parent, count in self.parent_types.items():
+            click.secho(f'{count:4d} {parent}')
+        click.secho('{:4d} roles missing ID'.format(self.missing_person_id))
+        for role, count in self.role_types.items():
+            click.secho(f'{count:4d} {role} roles')
+
 
 def process_dir(abbr, verbose, summary, settings):
-    filenames = glob.glob(os.path.join(get_data_dir(abbr), '*.yml'))
+    person_filenames = glob.glob(os.path.join(get_data_dir(abbr), 'people', '*.yml'))
+    retired_filenames = glob.glob(os.path.join(get_data_dir(abbr), 'retired', '*.yml'))
+    org_filenames = glob.glob(os.path.join(get_data_dir(abbr), 'organizations', '*.yml'))
     validator = Validator(settings, abbr)
 
-    for filename in filenames:
+    for filename in person_filenames:
         print_filename = os.path.basename(filename)
         with open(filename) as f:
             person = yaml.load(f)
             validator.validate_person(person, print_filename)
 
+    for filename in retired_filenames:
+        print_filename = os.path.basename(filename)
+        with open(filename) as f:
+            person = yaml.load(f)
+            validator.validate_person(person, print_filename, retired=True)
+
+    for filename in org_filenames:
+        print_filename = os.path.basename(filename)
+        with open(filename) as f:
+            org = yaml.load(f)
+            validator.validate_org(org, print_filename)
+
     validator.print_validation_report(verbose)
 
-    # summary
     if summary:
         validator.print_summary()
 
@@ -385,7 +479,8 @@ def process_dir(abbr, verbose, summary, settings):
 @click.option('-v', '--verbose', count=True)
 @click.option('--summary/--no-summary', default=False)
 def lint(abbr, verbose, summary):
-    with open(get_data_dir('settings.yml')) as f:
+    settings_file = os.path.join(os.path.dirname(__file__), '../settings.yml')
+    with open(settings_file) as f:
         settings = yaml.load(f)
 
     if abbr == '*':
